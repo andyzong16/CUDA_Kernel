@@ -22,30 +22,41 @@ void speedup_kernel(int B, std::ofstream& out) {
     for (auto& v : h_Wv) v = dist(gen);
     for (auto& v : h_Wo) v = dist(gen);
 
-    float *d_x, *d_Wu, *d_Wv, *d_Wo;
-    float *d_U, *d_V, *d_intermediate, *d_output;
+    // Convert FP32 to FP16
+    std::vector<__half> h_x_fp16(h_x.size());
+    std::vector<__half> h_Wu_fp16(h_Wu.size());
+    std::vector<__half> h_Wv_fp16(h_Wv.size());
+    std::vector<__half> h_Wo_fp16(h_Wo.size());
 
-    CHECK_CUDA(cudaMalloc(&d_x, B * HIDDEN_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(float)));
+    for (size_t i = 0; i < h_x.size(); i++) h_x_fp16[i] = __float2half(h_x[i]);
+    for (size_t i = 0; i < h_Wu.size(); i++) h_Wu_fp16[i] = __float2half(h_Wu[i]);
+    for (size_t i = 0; i < h_Wv.size(); i++) h_Wv_fp16[i] = __float2half(h_Wv[i]);
+    for (size_t i = 0; i < h_Wo.size(); i++) h_Wo_fp16[i] = __float2half(h_Wo[i]);
 
-    CHECK_CUDA(cudaMalloc(&d_U, B * INTERMEDIATE_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_V, B * INTERMEDIATE_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_intermediate, B * INTERMEDIATE_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(float)));
+    __half *d_x, *d_Wu, *d_Wv, *d_Wo;
+    __half *d_U, *d_V, *d_intermediate, *d_output;
 
-    CHECK_CUDA(cudaMemcpy(d_x,  h_x.data(),
-                          B * HIDDEN_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMalloc(&d_x, B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
+
+    CHECK_CUDA(cudaMalloc(&d_U, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_V, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_intermediate, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(__half)));
+
+    CHECK_CUDA(cudaMemcpy(d_x,  h_x_fp16.data(),
+                          B * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu.data(),
-                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu_fp16.data(),
+                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv.data(),
-                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv_fp16.data(),
+                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo.data(),
-                          HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo_fp16.data(),
+                          HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
 
     const int WARMUP = 10;

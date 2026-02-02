@@ -57,30 +57,41 @@ bool test_correctness(int B) {
     read_binary_f32(wv_path, h_Wv, static_cast<size_t>(INTERMEDIATE_SIZE) * HIDDEN_SIZE);
     read_binary_f32(wo_path, h_Wo, static_cast<size_t>(HIDDEN_SIZE) * INTERMEDIATE_SIZE);
 
-    float *d_x, *d_Wu, *d_Wv, *d_Wo;
-    float *d_U, *d_V, *d_intermediate, *d_output;
+    // Convert FP32 to FP16
+    std::vector<__half> h_x_fp16(h_x.size());
+    std::vector<__half> h_Wu_fp16(h_Wu.size());
+    std::vector<__half> h_Wv_fp16(h_Wv.size());
+    std::vector<__half> h_Wo_fp16(h_Wo.size());
 
-    CHECK_CUDA(cudaMalloc(&d_x, B * HIDDEN_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(float)));
+    for (size_t i = 0; i < h_x.size(); i++) h_x_fp16[i] = __float2half(h_x[i]);
+    for (size_t i = 0; i < h_Wu.size(); i++) h_Wu_fp16[i] = __float2half(h_Wu[i]);
+    for (size_t i = 0; i < h_Wv.size(); i++) h_Wv_fp16[i] = __float2half(h_Wv[i]);
+    for (size_t i = 0; i < h_Wo.size(); i++) h_Wo_fp16[i] = __float2half(h_Wo[i]);
 
-    CHECK_CUDA(cudaMalloc(&d_U, B * INTERMEDIATE_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_V, B * INTERMEDIATE_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_intermediate, B * INTERMEDIATE_SIZE * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(float)));
+    __half *d_x, *d_Wu, *d_Wv, *d_Wo;
+    __half *d_U, *d_V, *d_intermediate, *d_output;
 
-    CHECK_CUDA(cudaMemcpy(d_x,  h_x.data(),
-                          B * HIDDEN_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMalloc(&d_x, B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
+
+    CHECK_CUDA(cudaMalloc(&d_U, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_V, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_intermediate, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(__half)));
+
+    CHECK_CUDA(cudaMemcpy(d_x,  h_x_fp16.data(),
+                          B * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu.data(),
-                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu_fp16.data(),
+                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv.data(),
-                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv_fp16.data(),
+                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo.data(),
-                          HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(float),
+    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo_fp16.data(),
+                          HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
 
     // ------------------------------------------------------------
@@ -104,12 +115,18 @@ bool test_correctness(int B) {
     // ------------------------------------------------------------
     // Copy result back
     // ------------------------------------------------------------
-    std::vector<float> h_out(B * HIDDEN_SIZE);
+    std::vector<__half> h_out(B * HIDDEN_SIZE);
     CHECK_CUDA(cudaMemcpy(h_out.data(), d_output,
-                          B * HIDDEN_SIZE * sizeof(float),
+                          B * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyDeviceToHost));
 
-    write_binary_f32(out_cuda_path, h_out);
+    // Convert FP16 output back to FP32 for comparison
+    std::vector<float> h_out_fp32(h_out.size());
+    for (size_t i = 0; i < h_out.size(); i++) {
+        h_out_fp32[i] = __half2float(h_out[i]);
+    }
+
+    write_binary_f32(out_cuda_path, h_out_fp32);
     std::cout << "Wrote CUDA output: " << out_cuda_path << std::endl;
 
     CHECK_CUDA(cudaFree(d_x));

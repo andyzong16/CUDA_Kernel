@@ -25,8 +25,13 @@ nvcc -o speedup_kernel speedup_kernel.cu -lcublas -O3 -std=c++11
 With architecture-specific optimization (recommended):
 For Ampere architecture (A6000, RTX 6000, RTX 30xx):
 ```
-nvcc -o correctness_test correctness_test.cu -lcublas -O3 -std=c++11 -arch=sm_86
-nvcc -o speedup_kernel speedup_kernel.cu -lcublas -O3 -std=c++11 -arch=sm_86
+nvcc -o speedup_kernel speedup_kernel.cu -lcublas -O3 -std=c++11 \
+  -gencode=arch=compute_75,code=sm_75 \
+  -gencode=arch=compute_75,code=compute_75
+
+nvcc -o correctness_test correctness_test.cu -lcublas -O3 -std=c++11 \
+  -gencode=arch=compute_75,code=sm_75 \
+  -gencode=arch=compute_75,code=compute_75
 ```
 For Ada architecture (RTX 6000 Ada, RTX 40xx):
 ```
@@ -39,16 +44,10 @@ nvcc -o speedup_kernel speedup_kernel.cu -lcublas -O3 -std=c++11 -arch=sm_89
 -std=c++11: C++11 standard required for chrono and random libraries
 -arch=sm_XX: Specifies GPU compute capability for architecture-specific optimizations
 
-Running the Code
-Correctness (compare CUDA output to ffn.py):
+Speedup & Correctness (compare CUDA timing to ffn.py timing):
 ```
 python ffn.py
 ./correctness_test
-```
-
-Speedup (compare CUDA timing to ffn.py timing):
-```
-python ffn.py
 ./speedup_kernel
 python speedup_compare.py
 ```
