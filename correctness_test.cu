@@ -5,10 +5,6 @@
 #include <vector>
 #include "kernel"
 
-// ====================================================================================
-// Binary IO helpers
-// ====================================================================================
-
 void read_binary_f32(const std::string& path, std::vector<float>& data, size_t count) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -29,12 +25,11 @@ void write_binary_f32(const std::string& path, const std::vector<float>& data) {
         std::cerr << "Failed to write: " << path << std::endl;
         exit(1);
     }
-    out.write(reinterpret_cast<const char*>(data.data()),
-              data.size() * sizeof(float));
+    out.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
 }
 
 // ====================================================================================
-// Correctness Test (cuBLAS + GEGLU kernel)
+// Correctness Test (Wu/Wv + Fused GEGLU)
 // ====================================================================================
 
 bool test_correctness(int B) {
@@ -52,51 +47,54 @@ bool test_correctness(int B) {
 
     std::vector<float> h_x, h_Wu, h_Wv, h_Wo;
 
-    read_binary_f32(x_path,  h_x,  static_cast<size_t>(B) * HIDDEN_SIZE);
-    read_binary_f32(wu_path, h_Wu, static_cast<size_t>(INTERMEDIATE_SIZE) * HIDDEN_SIZE);
-    read_binary_f32(wv_path, h_Wv, static_cast<size_t>(INTERMEDIATE_SIZE) * HIDDEN_SIZE);
-    read_binary_f32(wo_path, h_Wo, static_cast<size_t>(HIDDEN_SIZE) * INTERMEDIATE_SIZE);
+    read_binary_f32(x_path,  h_x,  (size_t)B * HIDDEN_SIZE);
+    read_binary_f32(wu_path, h_Wu, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE);
+    read_binary_f32(wv_path, h_Wv, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE);
+    read_binary_f32(wo_path, h_Wo, (size_t)HIDDEN_SIZE * INTERMEDIATE_SIZE);
 
-    // Convert FP32 to FP16
+    // ---------------- FP32 -> FP16 ----------------
     std::vector<__half> h_x_fp16(h_x.size());
     std::vector<__half> h_Wu_fp16(h_Wu.size());
     std::vector<__half> h_Wv_fp16(h_Wv.size());
     std::vector<__half> h_Wo_fp16(h_Wo.size());
 
-    for (size_t i = 0; i < h_x.size(); i++) h_x_fp16[i] = __float2half(h_x[i]);
+    for (size_t i = 0; i < h_x.size(); i++)  h_x_fp16[i]  = __float2half(h_x[i]);
     for (size_t i = 0; i < h_Wu.size(); i++) h_Wu_fp16[i] = __float2half(h_Wu[i]);
     for (size_t i = 0; i < h_Wv.size(); i++) h_Wv_fp16[i] = __float2half(h_Wv[i]);
     for (size_t i = 0; i < h_Wo.size(); i++) h_Wo_fp16[i] = __float2half(h_Wo[i]);
 
+    // ---------------- DEVICE ALLOCATION ----------------
     __half *d_x, *d_Wu, *d_Wv, *d_Wo;
     __half *d_U, *d_V, *d_intermediate, *d_output;
 
-    CHECK_CUDA(cudaMalloc(&d_x, B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_x,  B * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
 
-    CHECK_CUDA(cudaMalloc(&d_U, B * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_V, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_U,  B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_V,  B * INTERMEDIATE_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_intermediate, B * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_output,       B * HIDDEN_SIZE * sizeof(__half)));
 
+    // ---------------- HOST -> DEVICE ----------------
     CHECK_CUDA(cudaMemcpy(d_x,  h_x_fp16.data(),
                           B * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
+
     CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu_fp16.data(),
                           INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
+
     CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv_fp16.data(),
                           INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
+
     CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo_fp16.data(),
                           HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half),
                           cudaMemcpyHostToDevice));
 
-    // ------------------------------------------------------------
-    // Run optimized GEGLU FFN
-    // ------------------------------------------------------------
+    // ---------------- RUN OPTIMIZED FFN ----------------
     geglu_ffn(
         handle,
         d_x,
@@ -112,31 +110,29 @@ bool test_correctness(int B) {
 
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // ------------------------------------------------------------
-    // Copy result back
-    // ------------------------------------------------------------
+    // ---------------- COPY BACK ----------------
     std::vector<__half> h_out(B * HIDDEN_SIZE);
     CHECK_CUDA(cudaMemcpy(h_out.data(), d_output,
                           B * HIDDEN_SIZE * sizeof(__half),
                           cudaMemcpyDeviceToHost));
 
-    // Convert FP16 output back to FP32 for comparison
+    // FP16 -> FP32
     std::vector<float> h_out_fp32(h_out.size());
-    for (size_t i = 0; i < h_out.size(); i++) {
+    for (size_t i = 0; i < h_out.size(); i++)
         h_out_fp32[i] = __half2float(h_out[i]);
-    }
 
     write_binary_f32(out_cuda_path, h_out_fp32);
     std::cout << "Wrote CUDA output: " << out_cuda_path << std::endl;
 
-    CHECK_CUDA(cudaFree(d_x));
-    CHECK_CUDA(cudaFree(d_Wu));
-    CHECK_CUDA(cudaFree(d_Wv));
-    CHECK_CUDA(cudaFree(d_Wo));
-    CHECK_CUDA(cudaFree(d_U));
-    CHECK_CUDA(cudaFree(d_V));
-    CHECK_CUDA(cudaFree(d_intermediate));
-    CHECK_CUDA(cudaFree(d_output));
+    // ---------------- CLEANUP ----------------
+    cudaFree(d_x);
+    cudaFree(d_Wu);
+    cudaFree(d_Wv);
+    cudaFree(d_Wo);
+    cudaFree(d_U);
+    cudaFree(d_V);
+    cudaFree(d_intermediate);
+    cudaFree(d_output);
 
     CHECK_CUBLAS(cublasDestroy(handle));
     return true;
@@ -145,7 +141,6 @@ bool test_correctness(int B) {
 int main() {
     int batch_sizes[] = {4, 8, 16, 32, 64, 128};
 
-    std::cout << "### CUDA OUTPUT DUMP ###" << std::endl;
     bool all_passed = true;
 
     for (int B : batch_sizes) {

@@ -3,7 +3,10 @@
 #include <iostream>
 #include <random>
 #include <vector>
-#include "kernel"
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
+#include <cuda_fp16.h>
+#include "kernel"  
 
 void speedup_kernel(int B, std::ofstream& out) {
     cublasHandle_t handle;
@@ -12,59 +15,50 @@ void speedup_kernel(int B, std::ofstream& out) {
     std::mt19937 gen(42 + B);
     std::normal_distribution<float> dist(0.0f, 0.02f);
 
-    std::vector<float> h_x(B * HIDDEN_SIZE);
-    std::vector<float> h_Wu(INTERMEDIATE_SIZE * HIDDEN_SIZE);
-    std::vector<float> h_Wv(INTERMEDIATE_SIZE * HIDDEN_SIZE);
-    std::vector<float> h_Wo(HIDDEN_SIZE * INTERMEDIATE_SIZE);
+    // ---------------- HOST (PINNED) ----------------
+    __half *h_x, *h_Wu, *h_Wv, *h_Wo;
 
-    for (auto& v : h_x)  v = dist(gen);
-    for (auto& v : h_Wu) v = dist(gen);
-    for (auto& v : h_Wv) v = dist(gen);
-    for (auto& v : h_Wo) v = dist(gen);
+    CHECK_CUDA(cudaMallocHost(&h_x,  B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMallocHost(&h_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMallocHost(&h_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMallocHost(&h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
 
-    // Convert FP32 to FP16
-    std::vector<__half> h_x_fp16(h_x.size());
-    std::vector<__half> h_Wu_fp16(h_Wu.size());
-    std::vector<__half> h_Wv_fp16(h_Wv.size());
-    std::vector<__half> h_Wo_fp16(h_Wo.size());
+    // Fill random
+    for (int i = 0; i < B * HIDDEN_SIZE; i++)
+        h_x[i] = __float2half(dist(gen));
 
-    for (size_t i = 0; i < h_x.size(); i++) h_x_fp16[i] = __float2half(h_x[i]);
-    for (size_t i = 0; i < h_Wu.size(); i++) h_Wu_fp16[i] = __float2half(h_Wu[i]);
-    for (size_t i = 0; i < h_Wv.size(); i++) h_Wv_fp16[i] = __float2half(h_Wv[i]);
-    for (size_t i = 0; i < h_Wo.size(); i++) h_Wo_fp16[i] = __float2half(h_Wo[i]);
+    for (int i = 0; i < INTERMEDIATE_SIZE * HIDDEN_SIZE; i++) {
+        h_Wu[i] = __float2half(dist(gen));
+        h_Wv[i] = __float2half(dist(gen));
+    }
 
+    for (int i = 0; i < HIDDEN_SIZE * INTERMEDIATE_SIZE; i++)
+        h_Wo[i] = __float2half(dist(gen));
+
+    // ---------------- DEVICE ----------------
     __half *d_x, *d_Wu, *d_Wv, *d_Wo;
     __half *d_U, *d_V, *d_intermediate, *d_output;
 
-    CHECK_CUDA(cudaMalloc(&d_x, B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_x,  B * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
 
-    CHECK_CUDA(cudaMalloc(&d_U, B * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_V, B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_U,  B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_V,  B * INTERMEDIATE_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_intermediate, B * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_output,       B * HIDDEN_SIZE * sizeof(__half)));
 
-    CHECK_CUDA(cudaMemcpy(d_x,  h_x_fp16.data(),
-                          B * HIDDEN_SIZE * sizeof(__half),
-                          cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu_fp16.data(),
-                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
-                          cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv_fp16.data(),
-                          INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
-                          cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo_fp16.data(),
-                          HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half),
-                          cudaMemcpyHostToDevice));
+    // ---------------- TRANSFERS ----------------
+    CHECK_CUDA(cudaMemcpy(d_x,  h_x,  B * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
 
-    const int WARMUP = 10;
-    const int ITERS  = 100;
+    const int WARMUP = 15;
+    const int ITERS  = 500;
 
-    // ------------------------------------------------------------
-    // Warmup
-    // ------------------------------------------------------------
+    // ---------------- WARMUP ----------------
     for (int i = 0; i < WARMUP; i++) {
         geglu_ffn(
             handle,
@@ -81,10 +75,12 @@ void speedup_kernel(int B, std::ofstream& out) {
     }
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // ------------------------------------------------------------
-    // Timing
-    // ------------------------------------------------------------
-    auto start = std::chrono::high_resolution_clock::now();
+    // ---------------- TIMING ----------------
+    cudaEvent_t start, stop;
+    CHECK_CUDA(cudaEventCreate(&start));
+    CHECK_CUDA(cudaEventCreate(&stop));
+
+    CHECK_CUDA(cudaEventRecord(start));
     for (int i = 0; i < ITERS; i++) {
         geglu_ffn(
             handle,
@@ -99,23 +95,32 @@ void speedup_kernel(int B, std::ofstream& out) {
             B
         );
     }
-    CHECK_CUDA(cudaDeviceSynchronize());
-    auto end = std::chrono::high_resolution_clock::now();
+    CHECK_CUDA(cudaEventRecord(stop));
+    CHECK_CUDA(cudaEventSynchronize(stop));
 
-    float ms =
-        std::chrono::duration<float, std::milli>(end - start).count() / ITERS;
+    float total_ms = 0;
+    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
+    float avg_ms = total_ms / ITERS;
 
-    std::cout << "Batch " << B << ": " << ms << " ms" << std::endl;
-    out << B << "," << ms << "\n";
+    out << B << "," << avg_ms << "\n";
 
-    CHECK_CUDA(cudaFree(d_x));
-    CHECK_CUDA(cudaFree(d_Wu));
-    CHECK_CUDA(cudaFree(d_Wv));
-    CHECK_CUDA(cudaFree(d_Wo));
-    CHECK_CUDA(cudaFree(d_U));
-    CHECK_CUDA(cudaFree(d_V));
-    CHECK_CUDA(cudaFree(d_intermediate));
-    CHECK_CUDA(cudaFree(d_output));
+    // ---------------- CLEANUP ----------------
+    CHECK_CUDA(cudaEventDestroy(start));
+    CHECK_CUDA(cudaEventDestroy(stop));
+
+    cudaFree(d_x);
+    cudaFree(d_Wu);
+    cudaFree(d_Wv);
+    cudaFree(d_Wo);
+    cudaFree(d_U);
+    cudaFree(d_V);
+    cudaFree(d_intermediate);
+    cudaFree(d_output);
+
+    cudaFreeHost(h_x);
+    cudaFreeHost(h_Wu);
+    cudaFreeHost(h_Wv);
+    cudaFreeHost(h_Wo);
 
     CHECK_CUBLAS(cublasDestroy(handle));
 }
@@ -123,14 +128,13 @@ void speedup_kernel(int B, std::ofstream& out) {
 int main() {
     int batch_sizes[] = {4, 8, 16, 32, 64, 128};
 
-    std::ofstream out("speedup_data/cuda_times.csv");
+    std::ofstream out("cuda_times.csv");
     if (!out) {
-        std::cerr << "Failed to write speedup_data/cuda_times.csv" << std::endl;
+        std::cerr << "Failed to write cuda_times.csv" << std::endl;
         return 1;
     }
     out << "B,ms\n";
 
-    std::cout << "### CUDA cuBLAS + GEGLU KERNEL TIMINGS ###" << std::endl;
     for (int B : batch_sizes) {
         speedup_kernel(B, out);
     }
