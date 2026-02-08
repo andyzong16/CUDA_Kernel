@@ -26,7 +26,7 @@
         } \
     } while (0)
 
-// Fast GELU: polynomial tanh approx (no tanhf call)
+// Fast GELU: polynomial tanh approx
 __device__ __forceinline__ float fast_gelu(float x) {
     float x3 = x * x * x;
     float z = 0.79788456f * (x + 0.044715f * x3);
@@ -38,14 +38,19 @@ __device__ __forceinline__ float fast_gelu(float x) {
 __global__ void geglu_kernel(half2* __restrict__ UV, int B) {
     const int h2sec = INTERMEDIATE_SIZE / 2;
     const int h2col = INTERMEDIATE_SIZE;
+
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= B * h2sec) return;
+
     int b = idx / h2sec;
     int k = idx % h2sec;
+
     size_t u = (size_t)b * h2col + k;
     size_t v = u + h2sec;
+
     float2 uf = __half22float2(__ldg(&UV[u]));
     float2 vf = __half22float2(__ldg(&UV[v]));
+
     UV[v] = __floats2half2_rn(fast_gelu(uf.x) * vf.x, fast_gelu(uf.y) * vf.y);
 }
 
@@ -60,18 +65,33 @@ void geglu_ffn(
     const __half one = __float2half(1.0f), zero = __float2half(0.0f);
 
     // GEMM 1: Wuv * x -> UV
-    cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-        2 * INTERMEDIATE_SIZE, B, HIDDEN_SIZE,
-        &one, Wuv, 2 * INTERMEDIATE_SIZE, x, HIDDEN_SIZE,
-        &zero, UV, 2 * INTERMEDIATE_SIZE);
+    cublasHgemm(handle, 
+        CUBLAS_OP_N, 
+        CUBLAS_OP_N,
+        2 * INTERMEDIATE_SIZE, 
+        B, 
+        HIDDEN_SIZE,
+        &one, 
+        Wuv, 
+        2 * INTERMEDIATE_SIZE, x, HIDDEN_SIZE, 
+        &zero, UV, 2 * INTERMEDIATE_SIZE); 
 
-    // GEGLU in-place (writes to V portion of UV)
     int n = B * (INTERMEDIATE_SIZE / 2);
     geglu_kernel<<<(n + 255) / 256, 256>>>((half2*)UV, B);
 
-    // GEMM 2: Wo * V -> output   (V at UV+INTER, lda=2*INTER)
-    cublasHgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-        HIDDEN_SIZE, B, INTERMEDIATE_SIZE,
-        &one, Wo, HIDDEN_SIZE, UV + INTERMEDIATE_SIZE, 2 * INTERMEDIATE_SIZE,
-        &zero, output, HIDDEN_SIZE);
+    // GEMM 2: Wo * V -> output 
+    cublasHgemm(handle, 
+        CUBLAS_OP_N, 
+        CUBLAS_OP_N,
+        HIDDEN_SIZE, 
+        B, 
+        INTERMEDIATE_SIZE,
+        &one, 
+        Wo, 
+        HIDDEN_SIZE, 
+        UV + INTERMEDIATE_SIZE, 
+        2 * INTERMEDIATE_SIZE,
+        &zero, 
+        output, 
+        HIDDEN_SIZE);
 }

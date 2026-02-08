@@ -24,18 +24,6 @@ void speedup_kernel(int B, std::ofstream& out) {
     CHECK_CUDA(cudaMallocHost(&h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMallocHost(&h_Wuv, 2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
 
-    // Fill random
-    for (int i = 0; i < B * HIDDEN_SIZE; i++)
-        h_x[i] = __float2half_rn(dist(gen));
-
-    for (int i = 0; i < INTERMEDIATE_SIZE * HIDDEN_SIZE; i++) {
-        h_Wu[i] = __float2half_rn(dist(gen));
-        h_Wv[i] = __float2half_rn(dist(gen));
-    }
-
-    for (int i = 0; i < HIDDEN_SIZE * INTERMEDIATE_SIZE; i++)
-        h_Wo[i] = __float2half_rn(dist(gen));
-
     // Pack Wuv = [Wu; Wv] stacked by rows (column-major)
     for (int col = 0; col < HIDDEN_SIZE; col++) {
         size_t base_u = (size_t)col * INTERMEDIATE_SIZE;
@@ -95,7 +83,6 @@ void speedup_kernel(int B, std::ofstream& out) {
     cudaFree(d_Wo);
     cudaFree(d_UV);
     cudaFree(d_output);
-
     cudaFreeHost(h_x);
     cudaFreeHost(h_Wu);
     cudaFreeHost(h_Wv);

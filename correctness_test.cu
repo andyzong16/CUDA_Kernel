@@ -103,7 +103,6 @@ bool test_correctness(int B) {
 
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // ---------------- COPY BACK ----------------
     std::vector<__half> h_out(B * HIDDEN_SIZE);
     CHECK_CUDA(cudaMemcpy(h_out.data(), d_output,
                           B * HIDDEN_SIZE * sizeof(__half),
@@ -117,7 +116,6 @@ bool test_correctness(int B) {
     write_binary_f32(out_cuda_path, h_out_fp32);
     std::cout << "Wrote CUDA output: " << out_cuda_path << std::endl;
 
-    // ---------------- CLEANUP ----------------
     cudaFree(d_x);
     cudaFree(d_Wuv);
     cudaFree(d_Wo);
