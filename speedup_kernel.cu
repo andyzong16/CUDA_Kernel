@@ -16,85 +16,67 @@ void speedup_kernel(int B, std::ofstream& out) {
     std::normal_distribution<float> dist(0.0f, 0.02f);
 
     // ---------------- HOST (PINNED) ----------------
-    __half *h_x, *h_Wu, *h_Wv, *h_Wo;
+    __half *h_x, *h_Wu, *h_Wv, *h_Wo, *h_Wuv;
 
     CHECK_CUDA(cudaMallocHost(&h_x,  B * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMallocHost(&h_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMallocHost(&h_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMallocHost(&h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMallocHost(&h_Wuv, 2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
 
     // Fill random
     for (int i = 0; i < B * HIDDEN_SIZE; i++)
-        h_x[i] = __float2half(dist(gen));
+        h_x[i] = __float2half_rn(dist(gen));
 
     for (int i = 0; i < INTERMEDIATE_SIZE * HIDDEN_SIZE; i++) {
-        h_Wu[i] = __float2half(dist(gen));
-        h_Wv[i] = __float2half(dist(gen));
+        h_Wu[i] = __float2half_rn(dist(gen));
+        h_Wv[i] = __float2half_rn(dist(gen));
     }
 
     for (int i = 0; i < HIDDEN_SIZE * INTERMEDIATE_SIZE; i++)
-        h_Wo[i] = __float2half(dist(gen));
+        h_Wo[i] = __float2half_rn(dist(gen));
+
+    // Pack Wuv = [Wu; Wv] stacked by rows (column-major)
+    for (int col = 0; col < HIDDEN_SIZE; col++) {
+        size_t base_u = (size_t)col * INTERMEDIATE_SIZE;
+        size_t base_uv = (size_t)col * (2 * INTERMEDIATE_SIZE);
+        for (int row = 0; row < INTERMEDIATE_SIZE; row++) {
+            h_Wuv[base_uv + row] = h_Wu[base_u + row];
+            h_Wuv[base_uv + row + INTERMEDIATE_SIZE] = h_Wv[base_u + row];
+        }
+    }
 
     // ---------------- DEVICE ----------------
-    __half *d_x, *d_Wu, *d_Wv, *d_Wo;
-    __half *d_U, *d_V, *d_intermediate, *d_output;
+    __half *d_x, *d_Wuv, *d_Wo;
+    __half *d_UV, *d_output;
 
     CHECK_CUDA(cudaMalloc(&d_x,  B * HIDDEN_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_Wuv, 2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
 
-    CHECK_CUDA(cudaMalloc(&d_U,  B * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_V,  B * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_intermediate, B * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMalloc(&d_output,       B * HIDDEN_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_UV, 2 * B * INTERMEDIATE_SIZE * sizeof(__half)));
+    CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(__half)));
 
     // ---------------- TRANSFERS ----------------
     CHECK_CUDA(cudaMemcpy(d_x,  h_x,  B * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wu, h_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wv, h_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_Wuv, h_Wuv, 2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
 
     const int WARMUP = 15;
     const int ITERS  = 500;
 
     // ---------------- WARMUP ----------------
-    for (int i = 0; i < WARMUP; i++) {
-        geglu_ffn(
-            handle,
-            d_x,
-            d_Wu,
-            d_Wv,
-            d_Wo,
-            d_U,
-            d_V,
-            d_intermediate,
-            d_output,
-            B
-        );
-    }
+    for (int i = 0; i < WARMUP; i++)
+        geglu_ffn(handle, d_x, d_Wuv, d_Wo, d_UV, d_output, B);
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    // ---------------- TIMING ----------------
     cudaEvent_t start, stop;
     CHECK_CUDA(cudaEventCreate(&start));
     CHECK_CUDA(cudaEventCreate(&stop));
 
     CHECK_CUDA(cudaEventRecord(start));
-    for (int i = 0; i < ITERS; i++) {
-        geglu_ffn(
-            handle,
-            d_x,
-            d_Wu,
-            d_Wv,
-            d_Wo,
-            d_U,
-            d_V,
-            d_intermediate,
-            d_output,
-            B
-        );
-    }
+    for (int i = 0; i < ITERS; i++)
+        geglu_ffn(handle, d_x, d_Wuv, d_Wo, d_UV, d_output, B);
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
@@ -109,18 +91,16 @@ void speedup_kernel(int B, std::ofstream& out) {
     CHECK_CUDA(cudaEventDestroy(stop));
 
     cudaFree(d_x);
-    cudaFree(d_Wu);
-    cudaFree(d_Wv);
+    cudaFree(d_Wuv);
     cudaFree(d_Wo);
-    cudaFree(d_U);
-    cudaFree(d_V);
-    cudaFree(d_intermediate);
+    cudaFree(d_UV);
     cudaFree(d_output);
 
     cudaFreeHost(h_x);
     cudaFreeHost(h_Wu);
     cudaFreeHost(h_Wv);
     cudaFreeHost(h_Wo);
+    cudaFreeHost(h_Wuv);
 
     CHECK_CUBLAS(cublasDestroy(handle));
 }

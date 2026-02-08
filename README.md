@@ -18,25 +18,25 @@ cuBLAS library
 
 Kernel compilation:
 ```
-nvcc -o correctness_test correctness_test.cu -lcublas -O3 -std=c++11
-nvcc -o speedup_kernel speedup_kernel.cu -lcublas -O3 -std=c++11
+nvcc -o correctness_test correctness_test.cu -lcublas -lcublasLt -O3 -std=c++11
+nvcc -o speedup_kernel speedup_kernel.cu -lcublas -lcublasLt -O3 -std=c++11
 ```
 
 With architecture-specific optimization (recommended):
 For Ampere architecture (A6000, RTX 6000, RTX 30xx):
 ```
-nvcc -o speedup_kernel speedup_kernel.cu -lcublas -O3 -std=c++11 \
+nvcc -o speedup_kernel speedup_kernel.cu -lcublas -lcublasLt -O3 -std=c++11 \
   -gencode=arch=compute_75,code=sm_75 \
   -gencode=arch=compute_75,code=compute_75
 
-nvcc -o correctness_test correctness_test.cu -lcublas -O3 -std=c++11 \
+nvcc -o correctness_test correctness_test.cu -lcublas -lcublasLt -O3 -std=c++11 \
   -gencode=arch=compute_75,code=sm_75 \
   -gencode=arch=compute_75,code=compute_75
 ```
 For Ada architecture (RTX 6000 Ada, RTX 40xx):
 ```
-nvcc -o correctness_test correctness_test.cu -lcublas -O3 -std=c++11 -arch=sm_89
-nvcc -o speedup_kernel speedup_kernel.cu -lcublas -O3 -std=c++11 -arch=sm_89
+nvcc -o correctness_test correctness_test.cu -lcublas -lcublasLt -O3 -std=c++11 -arch=sm_89
+nvcc -o speedup_kernel speedup_kernel.cu -lcublas -lcublasLt -O3 -std=c++11 -arch=sm_89
 ```
 
 -lcublas: Links the cuBLAS library for optimized matrix operations
