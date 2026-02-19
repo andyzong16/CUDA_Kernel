@@ -10,7 +10,7 @@ def read_times(path):
     return times
 
 py_path = os.path.join("speedup_data", "py_times.csv")
-cuda_path = os.path.join("speedup_data", "cuda_times.csv")
+cuda_path = os.path.join("cuda_times.csv")
 
 if not os.path.exists(py_path):
     raise FileNotFoundError(f"Missing {py_path}. Run ffn.py first.")

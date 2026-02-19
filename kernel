@@ -1,32 +1,12 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
-#include <cublas_v2.h>
 #include <iostream>
+#include "copy_async.cuh"
+#include "mma.cuh"
 
 #define HIDDEN_SIZE 4096
 #define INTERMEDIATE_SIZE 12288
 
-#define CHECK_CUDA(call) \
-    do { \
-        cudaError_t err = call; \
-        if (err != cudaSuccess) { \
-            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " \
-                      << cudaGetErrorString(err) << std::endl; \
-            exit(1); \
-        } \
-    } while (0)
-
-#define CHECK_CUBLAS(call) \
-    do { \
-        cublasStatus_t err = call; \
-        if (err != CUBLAS_STATUS_SUCCESS) { \
-            std::cerr << "cuBLAS error at " << __FILE__ << ":" << __LINE__ << " - " \
-                      << "status " << err << std::endl; \
-            exit(1); \
-        } \
-    } while (0)
-
-// Fast GELU: polynomial tanh approx
 __device__ __forceinline__ float fast_gelu(float x) {
     float x3 = x * x * x;
     float z = 0.79788456f * (x + 0.044715f * x3);
@@ -34,64 +14,114 @@ __device__ __forceinline__ float fast_gelu(float x) {
     return 0.5f * x * (1.0f + z * (27.0f + z2) / (27.0f + 9.0f * z2));
 }
 
-// GEGLU on interleaved UV (lda=2*INTER). Writes gelu(U)*V in-place over V.
-__global__ void geglu_kernel(half2* __restrict__ UV, int B) {
-    const int h2sec = INTERMEDIATE_SIZE / 2;
-    const int h2col = INTERMEDIATE_SIZE;
+union __align__(16) Shared {
+    struct { __half Wu[2][32][136], Wv[2][32][136], x[2][32][40]; } p1;
+    struct { __half V[32][136], Wo[128][72]; float Out[32][65]; } p2;
+};
+__shared__ Shared smem;
 
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= B * h2sec) return;
-
-    int b = idx / h2sec;
-    int k = idx % h2sec;
-
-    size_t u = (size_t)b * h2col + k;
-    size_t v = u + h2sec;
-
-    float2 uf = __half22float2(__ldg(&UV[u]));
-    float2 vf = __half22float2(__ldg(&UV[v]));
-
-    UV[v] = __floats2half2_rn(fast_gelu(uf.x) * vf.x, fast_gelu(uf.y) * vf.y);
+template<typename T> __device__ void my_load(T* d, const T* s) {
+#if __CUDA_ARCH__ >= 800
+    kernel::load_smem(d, s);
+#else
+    *(int4*)d = *(const int4*)s;
+#endif
 }
 
-void geglu_ffn(
-    cublasHandle_t handle,
-    const __half* x, const __half* Wuv, const __half* Wo,
-    __half* UV, __half* output, int B)
-{
-    static bool once = false;
-    if (!once) { cublasSetMathMode(handle, CUBLAS_TENSOR_OP_MATH); once = true; }
+template<int buf> __device__ void load_p1(int k0, int brow, int bcol, const __half* Wuv, const __half* x, int B) {
+    for (int i = threadIdx.x; i < 512; i += 256) {
+        int r = i % 16, c = i / 16;
+        my_load(&smem.p1.Wu[buf][c][r*8], &Wuv[(k0 + c) * 2 * INTERMEDIATE_SIZE + brow + r*8]);
+        my_load(&smem.p1.Wv[buf][c][r*8], &Wuv[(k0 + c) * 2 * INTERMEDIATE_SIZE + INTERMEDIATE_SIZE + brow + r*8]);
+    }
+    if (threadIdx.x < 128) {
+        int r = threadIdx.x % 4, c = threadIdx.x / 4;
+        if (bcol + c < B) my_load(&smem.p1.x[buf][c][r*8], &x[(bcol + c) * HIDDEN_SIZE + k0 + r*8]);
+        else *(int4*)&smem.p1.x[buf][c][r*8] = {0,0,0,0};
+    }
+}
 
-    const __half one = __float2half(1.0f), zero = __float2half(0.0f);
+#define LDSM(R, ptr, stride) do { \
+    int t = threadIdx.x % 32, tr = (t % 8) + 8 * (t / 16), tc = 8 * ((t / 8) % 2); \
+    kernel::ldsm((ptr) + tr * (stride) + tc, R); \
+} while(0)
 
-    // GEMM 1: Wuv * x -> UV
-    cublasHgemm(handle, 
-        CUBLAS_OP_N, 
-        CUBLAS_OP_N,
-        2 * INTERMEDIATE_SIZE, 
-        B, 
-        HIDDEN_SIZE,
-        &one, 
-        Wuv, 
-        2 * INTERMEDIATE_SIZE, x, HIDDEN_SIZE, 
-        &zero, UV, 2 * INTERMEDIATE_SIZE); 
+#define LDSM_T(R, ptr, stride) do { \
+    int t = threadIdx.x % 32, r = t % 16, c = 8 * (t / 16); \
+    kernel::ldsm_t((ptr) + c * (stride) + r, R); \
+} while(0)
 
-    int n = B * (INTERMEDIATE_SIZE / 2);
-    geglu_kernel<<<(n + 255) / 256, 256>>>((half2*)UV, B);
+__device__ void st_acc(__half* dst, float* acc, int stride) {
+    int t = threadIdx.x % 32, tr = t / 4, tc = (t % 4) * 2;
+    int r[8] = {tr, tr, tr+8, tr+8, tr, tr, tr+8, tr+8}, c[8] = {tc, tc+1, tc, tc+1, tc+8, tc+9, tc+8, tc+9};
+    for(int i=0; i<8; i++) dst[c[i] * stride + r[i]] = __float2half_rn(acc[i]);
+}
+__device__ void st_acc(float* dst, float* acc, int stride) {
+    int t = threadIdx.x % 32, tr = t / 4, tc = (t % 4) * 2;
+    int r[8] = {tr, tr, tr+8, tr+8, tr, tr, tr+8, tr+8}, c[8] = {tc, tc+1, tc, tc+1, tc+8, tc+9, tc+8, tc+9};
+    for(int i=0; i<8; i++) dst[c[i] * stride + r[i]] = acc[i];
+}
 
-    // GEMM 2: Wo * V -> output 
-    cublasHgemm(handle, 
-        CUBLAS_OP_N, 
-        CUBLAS_OP_N,
-        HIDDEN_SIZE, 
-        B, 
-        INTERMEDIATE_SIZE,
-        &one, 
-        Wo, 
-        HIDDEN_SIZE, 
-        UV + INTERMEDIATE_SIZE, 
-        2 * INTERMEDIATE_SIZE,
-        &zero, 
-        output, 
-        HIDDEN_SIZE);
+__global__ void fused_splitk_ffn_kernel(const __half* __restrict__ x, const __half* __restrict__ Wuv, const __half* __restrict__ Wo, __half* __restrict__ output, int B) {
+    int brow = blockIdx.y * 128, bcol = blockIdx.x * 32, wid = threadIdx.x / 32, wr = wid / 2, wc = wid % 2;
+    float u[2][8] = {0}, v[2][8] = {0};
+
+    load_p1<0>(0, brow, bcol, Wuv, x, B);
+    kernel::cp_async_fence();
+
+    for (int k = 0; k < HIDDEN_SIZE; k += 32) {
+        int b0 = (k / 32) % 2, b1 = 1 - b0;
+        kernel::cp_async_wait<0>();
+        __syncthreads();
+        if (k + 32 < HIDDEN_SIZE) {
+            if (b1 == 0) load_p1<0>(k + 32, brow, bcol, Wuv, x, B);
+            else         load_p1<1>(k + 32, brow, bcol, Wuv, x, B);
+            kernel::cp_async_fence();
+        }
+
+        uint32_t au[2][4], av[2][4], bx[4];
+        for (int s = 0; s < 2; s++) {
+            LDSM(bx, &smem.p1.x[b0][wc * 16][s * 16], 40);
+            for (int i = 0; i < 2; i++) {
+                LDSM_T(au[i], &smem.p1.Wu[b0][s * 16][wr * 32 + i * 16], 136);
+                LDSM_T(av[i], &smem.p1.Wv[b0][s * 16][wr * 32 + i * 16], 136);
+                kernel::mma_m16n16k16_bf16bf16bf32(u[i], au[i], bx, u[i]);
+                kernel::mma_m16n16k16_bf16bf16bf32(v[i], av[i], bx, v[i]);
+            }
+        }
+    }
+    __syncthreads();
+    
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 8; j++) v[i][j] = fast_gelu(u[i][j]) * v[i][j];
+        st_acc(&smem.p2.V[wc * 16][wr * 32 + i * 16], v[i], 136);
+    }
+    
+    int wr2 = wid % 4, wc2 = wid / 4;
+    for (int h_start = 0; h_start < HIDDEN_SIZE; h_start += 64) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 1024; i += 256) 
+            *(int4*)&smem.p2.Wo[i / 8][(i % 8) * 8] = *(const int4*)&Wo[(brow + i / 8) * HIDDEN_SIZE + h_start + (i % 8) * 8];
+        __syncthreads();
+
+        float out[8] = {0};
+        for (int k = 0; k < 128; k += 16) {
+            uint32_t a[4], b[4];
+            LDSM_T(a, &smem.p2.Wo[k][wr2 * 16], 72);
+            LDSM(b, &smem.p2.V[wc2 * 16][k], 136);
+            kernel::mma_m16n16k16_bf16bf16bf32(out, a, b, out);
+        }
+        st_acc(&smem.p2.Out[wc2 * 16][wr2 * 16], out, 65);
+        __syncthreads();
+
+        for (int i = threadIdx.x; i < 1024; i += 256) {
+            int c = i / 32, r2 = i % 32;
+            if (bcol + c < B) atomicAdd((half2*)&output[(bcol + c) * HIDDEN_SIZE + h_start + r2 * 2], __floats2half2_rn(smem.p2.Out[c][r2 * 2], smem.p2.Out[c][r2 * 2 + 1]));
+        }
+    }
+}
+
+void geglu_ffn(const __half* x, const __half* Wuv, const __half* Wo, __half* UV, __half* output, int B) {
+    cudaMemset(output, 0, B * HIDDEN_SIZE * sizeof(__half));
+    fused_splitk_ffn_kernel<<<dim3((B + 31) / 32, INTERMEDIATE_SIZE / 128), 256>>>(x, Wuv, Wo, output, B);
 }

@@ -4,14 +4,10 @@
 #include <random>
 #include <vector>
 #include <cuda_runtime.h>
-#include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include "kernel"  
 
 void speedup_kernel(int B, std::ofstream& out) {
-    cublasHandle_t handle;
-    CHECK_CUBLAS(cublasCreate(&handle));
-
     std::mt19937 gen(42 + B);
     std::normal_distribution<float> dist(0.0f, 0.02f);
 
@@ -23,6 +19,18 @@ void speedup_kernel(int B, std::ofstream& out) {
     CHECK_CUDA(cudaMallocHost(&h_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMallocHost(&h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMallocHost(&h_Wuv, 2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
+
+    // Fill random
+    for (int i = 0; i < B * HIDDEN_SIZE; i++)
+        h_x[i] = __float2half_rn(dist(gen));
+
+    for (int i = 0; i < INTERMEDIATE_SIZE * HIDDEN_SIZE; i++) {
+        h_Wu[i] = __float2half_rn(dist(gen));
+        h_Wv[i] = __float2half_rn(dist(gen));
+    }
+
+    for (int i = 0; i < HIDDEN_SIZE * INTERMEDIATE_SIZE; i++)
+        h_Wo[i] = __float2half_rn(dist(gen));
 
     // Pack Wuv = [Wu; Wv] stacked by rows (column-major)
     for (int col = 0; col < HIDDEN_SIZE; col++) {
@@ -55,7 +63,7 @@ void speedup_kernel(int B, std::ofstream& out) {
 
     // ---------------- WARMUP ----------------
     for (int i = 0; i < WARMUP; i++)
-        geglu_ffn(handle, d_x, d_Wuv, d_Wo, d_UV, d_output, B);
+        geglu_ffn(d_x, d_Wuv, d_Wo, d_UV, d_output, B);
     CHECK_CUDA(cudaDeviceSynchronize());
 
     cudaEvent_t start, stop;
@@ -64,7 +72,7 @@ void speedup_kernel(int B, std::ofstream& out) {
 
     CHECK_CUDA(cudaEventRecord(start));
     for (int i = 0; i < ITERS; i++)
-        geglu_ffn(handle, d_x, d_Wuv, d_Wo, d_UV, d_output, B);
+        geglu_ffn(d_x, d_Wuv, d_Wo, d_UV, d_output, B);
     CHECK_CUDA(cudaEventRecord(stop));
     CHECK_CUDA(cudaEventSynchronize(stop));
 
@@ -88,8 +96,6 @@ void speedup_kernel(int B, std::ofstream& out) {
     cudaFreeHost(h_Wv);
     cudaFreeHost(h_Wo);
     cudaFreeHost(h_Wuv);
-
-    CHECK_CUBLAS(cublasDestroy(handle));
 }
 
 int main() {

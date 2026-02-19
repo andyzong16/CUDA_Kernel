@@ -13,33 +13,30 @@ Requirements:
 CUDA Toolkit (tested with CUDA 11.0+)
 NVIDIA GPU with compute capability 6.0 or higher
 C++11 compatible compiler
-cuBLAS library
 
 
 Kernel compilation:
 ```
-nvcc -o correctness_test correctness_test.cu -lcublas -lcublasLt -O3 -std=c++11
-nvcc -o speedup_kernel speedup_kernel.cu -lcublas -lcublasLt -O3 -std=c++11
+nvcc -o correctness_test correctness_test.cu -O3 -std=c++11 -gencode=arch=compute_80,code=sm_80
+nvcc -o speedup_kernel speedup_kernel.cu -O3 -std=c++11 -gencode=arch=compute_80,code=sm_80
 ```
 
 With architecture-specific optimization (recommended):
 For Ampere architecture (A6000, RTX 6000, RTX 30xx):
 ```
-nvcc -o speedup_kernel speedup_kernel.cu -lcublas -lcublasLt -O3 -std=c++11 \
+nvcc -o speedup_kernel speedup_kernel.cu -O3 -std=c++11 \
   -gencode=arch=compute_75,code=sm_75 \
   -gencode=arch=compute_75,code=compute_75
 
-nvcc -o correctness_test correctness_test.cu -lcublas -lcublasLt -O3 -std=c++11 \
+nvcc -o correctness_test correctness_test.cu -O3 -std=c++11 \
   -gencode=arch=compute_75,code=sm_75 \
   -gencode=arch=compute_75,code=compute_75
 ```
 For Ada architecture (RTX 6000 Ada, RTX 40xx):
 ```
-nvcc -o correctness_test correctness_test.cu -lcublas -lcublasLt -O3 -std=c++11 -arch=sm_89
-nvcc -o speedup_kernel speedup_kernel.cu -lcublas -lcublasLt -O3 -std=c++11 -arch=sm_89
+nvcc -o correctness_test correctness_test.cu -O3 -std=c++11 -arch=sm_89
+nvcc -o speedup_kernel speedup_kernel.cu -O3 -std=c++11 -arch=sm_89
 ```
-
--lcublas: Links the cuBLAS library for optimized matrix operations
 -O3: Maximum compiler optimization level
 -std=c++11: C++11 standard required for chrono and random libraries
 -arch=sm_XX: Specifies GPU compute capability for architecture-specific optimizations
@@ -79,10 +76,6 @@ Speedup ratio (PyTorch / CUDA)
 Ensure CUDA toolkit is properly installed:
 ```
 nvcc --version
-```
-Verify cuBLAS is available:
-```
-ls /usr/local/cuda/lib64/libcublas.so
 ```
 
 Code Structure

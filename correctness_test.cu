@@ -35,9 +35,6 @@ void write_binary_f32(const std::string& path, const std::vector<float>& data) {
 bool test_correctness(int B) {
     std::cout << "\n=== Testing B=" << B << " ===" << std::endl;
 
-    cublasHandle_t handle;
-    CHECK_CUBLAS(cublasCreate(&handle));
-
     const std::string base = "correctness_data";
     const std::string x_path        = base + "/x_B" + std::to_string(B) + ".bin";
     const std::string wu_path       = base + "/Wu.bin";
@@ -99,7 +96,7 @@ bool test_correctness(int B) {
                           cudaMemcpyHostToDevice));
 
     // ---------------- RUN OPTIMIZED FFN ----------------
-    geglu_ffn(handle, d_x, d_Wuv, d_Wo, d_UV, d_output, B);
+    geglu_ffn(d_x, d_Wuv, d_Wo, d_UV, d_output, B);
 
     CHECK_CUDA(cudaDeviceSynchronize());
 
@@ -121,8 +118,6 @@ bool test_correctness(int B) {
     cudaFree(d_Wo);
     cudaFree(d_UV);
     cudaFree(d_output);
-
-    CHECK_CUBLAS(cublasDestroy(handle));
     return true;
 }
 
