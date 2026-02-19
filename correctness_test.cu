@@ -5,6 +5,16 @@
 #include <vector>
 #include "kernel"
 
+#define CHECK_CUDA(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " \
+                      << cudaGetErrorString(err) << std::endl; \
+            exit(1); \
+        } \
+    } while (0)
+
 void read_binary_f32(const std::string& path, std::vector<float>& data, size_t count) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {

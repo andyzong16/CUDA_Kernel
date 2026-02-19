@@ -1,48 +1,86 @@
-#include <chrono>
+#include <cmath>
 #include <fstream>
 #include <iostream>
-#include <random>
+#include <string>
 #include <vector>
-#include <cuda_runtime.h>
-#include <cuda_fp16.h>
-#include "kernel"  
+#include "kernel"
 
-void speedup_kernel(int B, std::ofstream& out) {
-    std::mt19937 gen(42 + B);
-    std::normal_distribution<float> dist(0.0f, 0.02f);
+#define CHECK_CUDA(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            std::cerr << "CUDA error at " << __FILE__ << ":" << __LINE__ << " - " \
+                      << cudaGetErrorString(err) << std::endl; \
+            exit(1); \
+        } \
+    } while (0)
 
-    // ---------------- HOST (PINNED) ----------------
-    __half *h_x, *h_Wu, *h_Wv, *h_Wo, *h_Wuv;
-
-    CHECK_CUDA(cudaMallocHost(&h_x,  B * HIDDEN_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMallocHost(&h_Wu, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMallocHost(&h_Wv, INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMallocHost(&h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half)));
-    CHECK_CUDA(cudaMallocHost(&h_Wuv, 2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half)));
-
-    // Fill random
-    for (int i = 0; i < B * HIDDEN_SIZE; i++)
-        h_x[i] = __float2half_rn(dist(gen));
-
-    for (int i = 0; i < INTERMEDIATE_SIZE * HIDDEN_SIZE; i++) {
-        h_Wu[i] = __float2half_rn(dist(gen));
-        h_Wv[i] = __float2half_rn(dist(gen));
+void read_binary_f32(const std::string& path, std::vector<float>& data, size_t count) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) {
+        std::cerr << "Failed to open: " << path << std::endl;
+        exit(1);
     }
+    data.resize(count);
+    in.read(reinterpret_cast<char*>(data.data()), count * sizeof(float));
+    if (!in) {
+        std::cerr << "Failed to read: " << path << std::endl;
+        exit(1);
+    }
+}
 
-    for (int i = 0; i < HIDDEN_SIZE * INTERMEDIATE_SIZE; i++)
-        h_Wo[i] = __float2half_rn(dist(gen));
+void write_binary_f32(const std::string& path, const std::vector<float>& data) {
+    std::ofstream out(path, std::ios::binary);
+    if (!out) {
+        std::cerr << "Failed to write: " << path << std::endl;
+        exit(1);
+    }
+    out.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(float));
+}
+
+// ====================================================================================
+// Correctness Test (Wu/Wv + Fused GEGLU)
+// ====================================================================================
+
+bool test_correctness(int B) {
+
+    const std::string base = "correctness_data";
+    const std::string x_path        = base + "/x_B" + std::to_string(B) + ".bin";
+    const std::string wu_path       = base + "/Wu.bin";
+    const std::string wv_path       = base + "/Wv.bin";
+    const std::string wo_path       = base + "/Wo.bin";
+    const std::string out_cuda_path = base + "/out_cuda_B" + std::to_string(B) + ".bin";
+
+    std::vector<float> h_x, h_Wu, h_Wv, h_Wo;
+
+    read_binary_f32(x_path,  h_x,  (size_t)B * HIDDEN_SIZE);
+    read_binary_f32(wu_path, h_Wu, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE);
+    read_binary_f32(wv_path, h_Wv, (size_t)INTERMEDIATE_SIZE * HIDDEN_SIZE);
+    read_binary_f32(wo_path, h_Wo, (size_t)HIDDEN_SIZE * INTERMEDIATE_SIZE);
+
+    // ---------------- FP32 -> FP16 ----------------
+    std::vector<__half> h_x_fp16(h_x.size());
+    std::vector<__half> h_Wu_fp16(h_Wu.size());
+    std::vector<__half> h_Wv_fp16(h_Wv.size());
+    std::vector<__half> h_Wo_fp16(h_Wo.size());
+    std::vector<__half> h_Wuv_fp16((size_t)2 * INTERMEDIATE_SIZE * HIDDEN_SIZE);
+
+    for (size_t i = 0; i < h_x.size(); i++)  h_x_fp16[i]  = __float2half(h_x[i]);
+    for (size_t i = 0; i < h_Wu.size(); i++) h_Wu_fp16[i] = __float2half(h_Wu[i]);
+    for (size_t i = 0; i < h_Wv.size(); i++) h_Wv_fp16[i] = __float2half(h_Wv[i]);
+    for (size_t i = 0; i < h_Wo.size(); i++) h_Wo_fp16[i] = __float2half(h_Wo[i]);
 
     // Pack Wuv = [Wu; Wv] stacked by rows (column-major)
     for (int col = 0; col < HIDDEN_SIZE; col++) {
         size_t base_u = (size_t)col * INTERMEDIATE_SIZE;
         size_t base_uv = (size_t)col * (2 * INTERMEDIATE_SIZE);
         for (int row = 0; row < INTERMEDIATE_SIZE; row++) {
-            h_Wuv[base_uv + row] = h_Wu[base_u + row];
-            h_Wuv[base_uv + row + INTERMEDIATE_SIZE] = h_Wv[base_u + row];
+            h_Wuv_fp16[base_uv + row] = h_Wu_fp16[base_u + row];
+            h_Wuv_fp16[base_uv + row + INTERMEDIATE_SIZE] = h_Wv_fp16[base_u + row];
         }
     }
 
-    // ---------------- DEVICE ----------------
+    // ---------------- DEVICE ALLOCATION ----------------
     __half *d_x, *d_Wuv, *d_Wo;
     __half *d_UV, *d_output;
 
@@ -53,64 +91,58 @@ void speedup_kernel(int B, std::ofstream& out) {
     CHECK_CUDA(cudaMalloc(&d_UV, 2 * B * INTERMEDIATE_SIZE * sizeof(__half)));
     CHECK_CUDA(cudaMalloc(&d_output, B * HIDDEN_SIZE * sizeof(__half)));
 
-    // ---------------- TRANSFERS ----------------
-    CHECK_CUDA(cudaMemcpy(d_x,  h_x,  B * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wuv, h_Wuv, 2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo, HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half), cudaMemcpyHostToDevice));
+    // ---------------- HOST -> DEVICE ----------------
+    CHECK_CUDA(cudaMemcpy(d_x,  h_x_fp16.data(),
+                          B * HIDDEN_SIZE * sizeof(__half),
+                          cudaMemcpyHostToDevice));
 
-    const int WARMUP = 15;
-    const int ITERS  = 500;
+    CHECK_CUDA(cudaMemcpy(d_Wuv, h_Wuv_fp16.data(),
+                          2 * INTERMEDIATE_SIZE * HIDDEN_SIZE * sizeof(__half),
+                          cudaMemcpyHostToDevice));
 
-    // ---------------- WARMUP ----------------
-    for (int i = 0; i < WARMUP; i++)
-        geglu_ffn(d_x, d_Wuv, d_Wo, d_UV, d_output, B);
+    CHECK_CUDA(cudaMemcpy(d_Wo, h_Wo_fp16.data(),
+                          HIDDEN_SIZE * INTERMEDIATE_SIZE * sizeof(__half),
+                          cudaMemcpyHostToDevice));
+
+    // ---------------- RUN OPTIMIZED FFN ----------------
+    geglu_ffn(d_x, d_Wuv, d_Wo, d_UV, d_output, B);
+
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    cudaEvent_t start, stop;
-    CHECK_CUDA(cudaEventCreate(&start));
-    CHECK_CUDA(cudaEventCreate(&stop));
+    std::vector<__half> h_out(B * HIDDEN_SIZE);
+    CHECK_CUDA(cudaMemcpy(h_out.data(), d_output,
+                          B * HIDDEN_SIZE * sizeof(__half),
+                          cudaMemcpyDeviceToHost));
 
-    CHECK_CUDA(cudaEventRecord(start));
-    for (int i = 0; i < ITERS; i++)
-        geglu_ffn(d_x, d_Wuv, d_Wo, d_UV, d_output, B);
-    CHECK_CUDA(cudaEventRecord(stop));
-    CHECK_CUDA(cudaEventSynchronize(stop));
+    // FP16 -> FP32
+    std::vector<float> h_out_fp32(h_out.size());
+    for (size_t i = 0; i < h_out.size(); i++)
+        h_out_fp32[i] = __half2float(h_out[i]);
 
-    float total_ms = 0;
-    CHECK_CUDA(cudaEventElapsedTime(&total_ms, start, stop));
-    float avg_ms = total_ms / ITERS;
-
-    out << B << "," << avg_ms << "\n";
-
-    // ---------------- CLEANUP ----------------
-    CHECK_CUDA(cudaEventDestroy(start));
-    CHECK_CUDA(cudaEventDestroy(stop));
+    write_binary_f32(out_cuda_path, h_out_fp32);
 
     cudaFree(d_x);
     cudaFree(d_Wuv);
     cudaFree(d_Wo);
     cudaFree(d_UV);
     cudaFree(d_output);
-    cudaFreeHost(h_x);
-    cudaFreeHost(h_Wu);
-    cudaFreeHost(h_Wv);
-    cudaFreeHost(h_Wo);
-    cudaFreeHost(h_Wuv);
+    return true;
 }
 
 int main() {
     int batch_sizes[] = {4, 8, 16, 32, 64, 128};
 
-    std::ofstream out("cuda_times.csv");
-    if (!out) {
-        std::cerr << "Failed to write cuda_times.csv" << std::endl;
-        return 1;
-    }
-    out << "B,ms\n";
+    bool all_passed = true;
 
     for (int B : batch_sizes) {
-        speedup_kernel(B, out);
+        if (!test_correctness(B)) all_passed = false;
     }
 
+    if (!all_passed) {
+        std::cout << "\n✗ Some tests failed!" << std::endl;
+        return 1;
+    }
+
+    std::cout << "\n✓ All correctness tests PASSED!\n" << std::endl;
     return 0;
 }

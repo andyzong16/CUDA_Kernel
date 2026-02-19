@@ -21,26 +21,6 @@ nvcc -o correctness_test correctness_test.cu -O3 -std=c++11 -gencode=arch=comput
 nvcc -o speedup_kernel speedup_kernel.cu -O3 -std=c++11 -gencode=arch=compute_80,code=sm_80
 ```
 
-With architecture-specific optimization (recommended):
-For Ampere architecture (A6000, RTX 6000, RTX 30xx):
-```
-nvcc -o speedup_kernel speedup_kernel.cu -O3 -std=c++11 \
-  -gencode=arch=compute_75,code=sm_75 \
-  -gencode=arch=compute_75,code=compute_75
-
-nvcc -o correctness_test correctness_test.cu -O3 -std=c++11 \
-  -gencode=arch=compute_75,code=sm_75 \
-  -gencode=arch=compute_75,code=compute_75
-```
-For Ada architecture (RTX 6000 Ada, RTX 40xx):
-```
-nvcc -o correctness_test correctness_test.cu -O3 -std=c++11 -arch=sm_89
-nvcc -o speedup_kernel speedup_kernel.cu -O3 -std=c++11 -arch=sm_89
-```
--O3: Maximum compiler optimization level
--std=c++11: C++11 standard required for chrono and random libraries
--arch=sm_XX: Specifies GPU compute capability for architecture-specific optimizations
-
 Speedup & Correctness (compare CUDA timing to ffn.py timing):
 ```
 python ffn.py
@@ -48,12 +28,6 @@ python ffn.py
 ./speedup_kernel
 python speedup_compare.py
 ```
-
-Expected output structure:
-### CUDA OUTPUT DUMP ###
-=== Testing B=4 ===
-Wrote CUDA output: correctness_data/out_cuda_B4.bin
-...
 
 ### SPEEDUP (PyTorch / CUDA kernel) ###
 B=  4: <ratio>x (py=<ms> ms, cuda=<ms> ms)
@@ -77,24 +51,3 @@ Ensure CUDA toolkit is properly installed:
 ```
 nvcc --version
 ```
-
-Code Structure
-kernel
-├── GELU activation function (device)
-├── Optimized implementation
-│   ├── geglu_tiled_kernel (fused with tiling)
-│   └── geglu_ffn_tiled (orchestration)
-
-correctness_test.cu
-└── Runs CUDA kernel and writes correctness_data/out_cuda_B*.bin
-
-ffn.py
-├── Runs PyTorch GEGLU FFN
-├── Writes correctness_data inputs/outputs
-└── Computes diffs if CUDA outputs exist
-
-speedup_kernel.cu
-└── Writes speedup_data/cuda_times.csv
-
-speedup_compare.py
-└── Reads speedup_data/*.csv and prints speedup
